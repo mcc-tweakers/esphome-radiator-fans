@@ -1,0 +1,557 @@
+# RadiatorFan: ESPHome firmware for PWM fans on a hydronic radiator (ESP32).
+#
+# Use this file as a package from a small per-device file (see example.yaml) or copy it
+# and fill in the substitutions below. Anything set in your own file overrides the
+# defaults here.
+#
+# Required per device:
+#   name, friendly_name          device name (unique per ESP)
+#   addr_supply, addr_return     1-Wire addresses of the two DS18B20 sensors
+# Optional:
+#   ha_*                         Home Assistant entities used by the controller
+#   pin_*                        GPIO numbers (numbers only, e.g. "27")
+#   exp_*                        night window for the experiment mode
+
+substitutions:
+  # ---- Home Assistant entities (replace with your own entity IDs) ----
+  # Room temperature next to the radiator. Without it the controller assumes 20 °C.
+  ha_room_temp: sensor.living_room_temperature
+  # Thermostat for the room; its 'temperature' attribute is used as the setpoint.
+  ha_thermostat: climate.living_room
+  # Heat pump defrost (on/off). During a defrost the fans are switched off.
+  ha_defrost: binary_sensor.heat_pump_defrost
+  # Heat pump compressor running (on/off). Only needed for the experiment mode.
+  ha_compressor: binary_sensor.heat_pump_compressor
+
+  # ---- Pins (ESP32 GPIO numbers) ----
+  pin_pwm: "25"          # fan PWM (fan pin 4)
+  pin_tach: "26"         # fan tachometer (fan pin 3)
+  pin_onewire: "27"      # DS18B20 data, 4.7k pull-up to 3.3 V
+  pin_ds_power: "14"     # DS18B20 VDD, powered from a GPIO so stuck sensors can be power-cycled
+
+  # ---- Experiment mode ----
+  exp_night_start: "23"  # start of the night window (60 % allowed), local time
+  exp_night_end: "6"     # end of the night window; outside it the max is "Auto max PWM"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    - priority: 700      # before the 1-Wire scan: power the DS18B20s
+      then:
+        - output.turn_on: ds_power
+    - priority: -100
+      then:
+        # Manual: restore the slider value. Automatic: the controller starts on the first interval.
+        - if:
+            condition:
+              lambda: "return id(fan_mode).active_index().value_or(0) == 1;"
+            then:
+              - output.set_level:
+                  id: fan_pwm_output
+                  level: !lambda "return id(fan_pwm).state / 100.0;"
+            else:
+              - output.set_level:
+                  id: fan_pwm_output
+                  level: 0%
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${name} fallback"
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+  - platform: sntp
+    id: sntp_time
+
+web_server:
+  port: 80
+  version: 3
+
+output:
+  # DS18B20 supply from a GPIO (VDD wire to this pin instead of 3V3; two sensors draw ~3 mA)
+  - platform: gpio
+    id: ds_power
+    pin: GPIO${pin_ds_power}
+
+  # PWM to the fans
+  - platform: ledc
+    id: fan_pwm_output
+    pin: GPIO${pin_pwm}
+    frequency: 25000 Hz   # Intel 4-pin fan spec: 25 kHz
+    # inverted: true      # only if you drive the PWM line through a transistor/MOSFET
+
+# ---------- Internal controller state ----------
+globals:
+  - id: pwm_current        # current PWM in % (after ramping)
+    type: float
+    initial_value: "0.0"
+  - id: fans_on            # hysteresis state of the start threshold
+    type: bool
+    initial_value: "false"
+  - id: ds_resets          # number of DS18B20 power cycles
+    type: int
+    restore_value: true
+    initial_value: "0"
+
+# ---------- Controls ----------
+select:
+  - platform: template
+    id: fan_mode
+    name: "Fan mode"
+    icon: mdi:fan-auto
+    options:
+      - "Automatic"     # index 0
+      - "Manual"        # index 1
+      - "Experiment"    # index 2: random fixed level per heat pump cycle
+    initial_option: "Automatic"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - if:
+          condition:
+            lambda: "return i == 1;"
+          then:
+            - lambda: |-
+                id(pwm_current) = id(fan_pwm).state;
+                id(fan_pwm_output).set_level(id(pwm_current) / 100.0f);
+
+number:
+  - platform: template
+    id: fan_pwm
+    name: "Manual PWM"
+    icon: mdi:fan
+    unit_of_measurement: "%"
+    min_value: 0          # 0 = fans off
+    max_value: 100
+    step: 1
+    mode: slider
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    on_value:
+      - if:
+          condition:
+            lambda: "return id(fan_mode).active_index().value_or(0) == 1;"
+          then:
+            - lambda: |-
+                id(pwm_current) = x;
+                id(fan_pwm_output).set_level(x / 100.0f);
+
+  # Settings of the automatic controller (adjustable in the web UI / Home Assistant)
+  - platform: template
+    id: pwm_min
+    name: "Auto min PWM"
+    icon: mdi:fan-speed-1
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 50
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 20
+
+  - platform: template
+    id: pwm_max
+    name: "Auto max PWM"
+    icon: mdi:fan-speed-3
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 40
+
+  - platform: template
+    id: start_delta
+    name: "Start at supply above room"
+    icon: mdi:thermometer-chevron-up
+    entity_category: config
+    unit_of_measurement: "K"
+    min_value: 2
+    max_value: 15
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+
+  - platform: template
+    id: full_delta
+    name: "Max PWM at supply above room"
+    icon: mdi:thermometer-chevron-up
+    entity_category: config
+    unit_of_measurement: "K"
+    min_value: 5
+    max_value: 30
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 15
+
+one_wire:
+  - platform: gpio
+    id: dallas_bus
+    pin: GPIO${pin_onewire}
+
+sensor:
+  # ---------- Fan tachometer ----------
+  - platform: pulse_counter
+    name: "Fan speed"
+    id: fan_rpm
+    pin:
+      number: GPIO${pin_tach}
+      mode:
+        input: true
+        pullup: true      # weak internal pull-up; an external 10k to 3.3 V is recommended
+    unit_of_measurement: "rpm"
+    icon: mdi:fan
+    accuracy_decimals: 0
+    update_interval: 10s
+    internal_filter: 13us
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    filters:
+      - multiply: 0.5     # 2 pulses per revolution
+
+  # ---------- Radiator temperatures ----------
+  # Find the addresses in the boot log ("gpio.one_wire: 0x... (DS18B20)");
+  # warm one sensor with your hand to tell them apart.
+  - platform: dallas_temp
+    one_wire_id: dallas_bus
+    address: ${addr_supply}
+    id: temp_supply
+    name: "Supply temperature"
+    resolution: 12
+    update_interval: 10s
+
+  - platform: dallas_temp
+    one_wire_id: dallas_bus
+    address: ${addr_return}
+    id: temp_return
+    name: "Return temperature"
+    resolution: 12
+    update_interval: 10s
+
+  - platform: template
+    id: delta_t
+    name: "Radiator delta T"
+    unit_of_measurement: "K"
+    icon: mdi:thermometer-lines
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: 10s
+    lambda: |-
+      const float a = id(temp_supply).state;
+      const float r = id(temp_return).state;
+      if (std::isnan(a) || std::isnan(r)) return NAN;
+      return a - r;
+
+  # ---------- From Home Assistant ----------
+  - platform: homeassistant
+    id: room_temp
+    entity_id: ${ha_room_temp}
+    unit_of_measurement: "°C"
+    device_class: temperature
+    internal: true
+
+  - platform: homeassistant
+    id: room_setpoint
+    entity_id: ${ha_thermostat}
+    attribute: temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    internal: true
+
+  # ---------- Controller status ----------
+  - platform: template
+    id: pwm_status
+    name: "Fan PWM"
+    icon: mdi:fan
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: "return id(pwm_current);"
+
+  - platform: template
+    name: "DS18B20 power cycles"
+    icon: mdi:restart-alert
+    entity_category: diagnostic
+    state_class: total_increasing
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: "return id(ds_resets);"
+
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "Uptime"
+
+text_sensor:
+  - platform: version
+    name: "Firmware build"
+    icon: mdi:chip
+    entity_category: diagnostic
+
+  # Read as text so both binary_sensor (on/off) and numeric (1/0) entities work
+  - platform: homeassistant
+    id: hp_compressor_raw
+    entity_id: ${ha_compressor}
+    internal: true
+
+  - platform: homeassistant
+    id: hp_defrost_raw
+    entity_id: ${ha_defrost}
+    internal: true
+
+  - platform: template
+    id: control_reason
+    name: "Fan control"
+    icon: mdi:information-outline
+    update_interval: never
+
+  - platform: template
+    id: exp_log
+    name: "Experiment cycle"
+    icon: mdi:clipboard-text-clock-outline
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    id: hp_compressor
+    name: "Heat pump compressor"
+    device_class: running
+    lambda: |-
+      std::string s = id(hp_compressor_raw).state;
+      for (auto &c : s) c = tolower(c);
+      return s == "on" || s == "1" || s == "1.0" || s == "true";
+
+  - platform: template
+    id: hp_defrost
+    name: "Heat pump defrost"
+    icon: mdi:snowflake-melt
+    lambda: |-
+      std::string s = id(hp_defrost_raw).state;
+      for (auto &c : s) c = tolower(c);
+      return s == "on" || s == "1" || s == "1.0" || s == "true";
+
+  - platform: template
+    name: "Radiator sensor fault"
+    device_class: problem
+    lambda: "return std::isnan(id(temp_supply).state) || std::isnan(id(temp_return).state);"
+    filters:
+      - delayed_on: 60s
+
+# ---------- Controller (every 5 s) ----------
+# Fan mode:
+#   Automatic  -> proportional to how warm the radiator is (see README)
+#   Manual     -> "Manual PWM" slider
+#   Experiment -> every heat pump cycle gets a random fixed level (0/20/40/60 %, shuffled so the
+#                 levels stay balanced; 60 % only in the night window). A cycle starts when a defrost
+#                 ends or the compressor starts, and ends when a defrost starts or the compressor
+#                 stops. Outside cycles the automatic controller runs. The heat output per level is
+#                 analysed afterwards from the Home Assistant history.
+interval:
+  # Watchdog: no DS18B20 reading for > 60 s -> power-cycle the sensors (at most once per 5 min)
+  - interval: 10s
+    then:
+      - lambda: |-
+          static uint32_t nan_since = 0, last_reset = 0;
+          const bool fault = std::isnan(id(temp_supply).state) || std::isnan(id(temp_return).state);
+          const uint32_t now = millis();
+          if (!fault) { nan_since = 0; return; }
+          if (nan_since == 0) nan_since = now;
+          if (now - nan_since > 60000UL && (last_reset == 0 || now - last_reset > 300000UL)) {
+            last_reset = now; nan_since = 0;
+            id(ds_power_cycle).execute();
+          }
+
+  - interval: 5s
+    then:
+      - lambda: |-
+          const int mode = id(fan_mode).active_index().value_or(0);
+          const uint32_t now = millis();
+          const float supply   = id(temp_supply).state;
+          const float ret      = id(temp_return).state;
+          const bool  comp     = id(hp_compressor).state;
+          const bool  defrost  = id(hp_defrost).state;
+          const float setpoint = id(room_setpoint).state;
+
+          // ---- events ----
+          static bool prev_defrost = false, prev_comp = false, init = false;
+          // no false cycle start after a reboot: only detect edges once the HA states are in
+          const bool ha_ok = !id(hp_compressor_raw).state.empty() && !id(hp_defrost_raw).state.empty();
+          if (!init || !ha_ok) { prev_defrost = defrost; prev_comp = comp; init = ha_ok; }
+          const bool defrost_start = defrost && !prev_defrost;
+          const bool defrost_end   = !defrost && prev_defrost;
+          const bool comp_start    = comp && !prev_comp;
+          const bool comp_stop     = !comp && prev_comp;
+          prev_defrost = defrost; prev_comp = comp;
+
+          // ---- clock / night window ----
+          auto t = id(ha_time).now();
+          if (!t.is_valid()) t = id(sntp_time).now();
+          const bool night = t.is_valid() && (t.hour >= ${exp_night_start} || t.hour < ${exp_night_end});
+
+          // ---- experiment: cycle with a fixed level ----
+          static bool cyc_active = false;
+          static int  cyc_level = 0;
+          static uint32_t cyc_start = 0;
+          static int  bag[4] = {0, 20, 40, 60};
+          static int  bag_pos = 4;
+          static char cyc_time[6] = "--:--";
+
+          // shuffled bag; levels above the limit are skipped and kept for later
+          auto draw_level = [&](float limit) -> int {
+            for (int attempt = 0; attempt < 2; attempt++) {
+              if (bag_pos >= 4) {
+                for (int i = 3; i > 0; i--) { const int j = random_uint32() % (i + 1); std::swap(bag[i], bag[j]); }
+                bag_pos = 0;
+              }
+              for (int i = bag_pos; i < 4; i++) {
+                if (bag[i] <= limit + 0.01f) { std::swap(bag[i], bag[bag_pos]); return bag[bag_pos++]; }
+              }
+              bag_pos = 4;
+            }
+            return 0;
+          };
+          auto log_cycle = [&](const char *s) {
+            id(exp_log).publish_state(s);
+            ESP_LOGI("experiment", "%s", s);
+          };
+
+          if (cyc_active && (defrost_start || comp_stop || mode != 2)) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "end cycle %s %d%% after %lu min (%s)", cyc_time, cyc_level,
+                     (unsigned long) ((now - cyc_start) / 60000),
+                     defrost_start ? "defrost" : comp_stop ? "compressor off" : "mode changed");
+            log_cycle(buf);
+            cyc_active = false;
+          }
+          if (mode == 2 && comp && !defrost && (defrost_end || comp_start)) {
+            const float limit = night ? 60.0f : std::max(id(pwm_max).state, 20.0f);
+            cyc_level = draw_level(limit);
+            cyc_active = true; cyc_start = now;
+            snprintf(cyc_time, sizeof(cyc_time), "%02d:%02d", t.hour, t.minute);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "start cycle %s: %d%% (after %s) | setpoint %.1f", cyc_time, cyc_level,
+                     defrost_end ? "defrost" : "compressor start", setpoint);
+            log_cycle(buf);
+          }
+
+          if (mode == 1) return;  // manual: the slider is in control
+
+          if (cyc_active) {
+            id(pwm_current) = cyc_level;
+            id(fan_pwm_output).set_level(cyc_level / 100.0f);
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Experiment: cycle %s at %d%% (%lu min)", cyc_time, cyc_level,
+                     (unsigned long) ((now - cyc_start) / 60000));
+            id(control_reason).publish_state(buf);
+            return;
+          }
+
+          // ---- automatic control (also in Experiment mode between cycles) ----
+          const float room_ha = id(room_temp).state;
+          const float room    = std::isnan(room_ha) ? 20.0f : room_ha;  // fallback without HA
+          const float pmin    = id(pwm_min).state;
+          const float pmax    = std::max(id(pwm_max).state, pmin);
+          const float d_start = id(start_delta).state;
+          const float d_full  = std::max(id(full_delta).state, d_start + 1.0f);
+
+          float target = 0.0f;
+          std::string reason;
+
+          if (std::isnan(supply) || std::isnan(ret)) {
+            reason = "RADIATOR SENSOR FAULT - off";
+          } else if (defrost) {
+            reason = "Heat pump defrosting - off";
+            id(fans_on) = false;
+          } else {
+            const float diff = supply - room;
+            if (diff >= d_start) id(fans_on) = true;
+            else if (diff < d_start - 2.0f) id(fans_on) = false;
+
+            if (!id(fans_on)) {
+              reason = "Radiator not warm enough - off";
+            } else {
+              float f = (diff - d_start) / (d_full - d_start);
+              f = std::min(std::max(f, 0.0f), 1.0f);
+              target = pmin + f * (pmax - pmin);
+              reason = "Proportional";
+              if (!std::isnan(room_ha) && !std::isnan(setpoint) && room_ha >= setpoint) {
+                target = pmin;
+                reason = "Room at setpoint - minimum";
+              }
+              if (std::isnan(room_ha)) reason += " (no room temperature from HA)";
+            }
+          }
+          if (mode == 2) reason += " | Experiment: waiting for cycle start";
+
+          // Smooth ramping: at most 1 %-point per 5 s; switching off is immediate
+          float cur = id(pwm_current);
+          if (target <= 0.0f) {
+            cur = 0.0f;
+          } else {
+            if (cur < pmin) cur = pmin;
+            if (target > cur) cur = std::min(target, cur + 1.0f);
+            else              cur = std::max(target, cur - 1.0f);
+          }
+          id(pwm_current) = cur;
+          id(fan_pwm_output).set_level(cur / 100.0f);
+
+          if (id(control_reason).state != reason) id(control_reason).publish_state(reason);
+
+# ---------- Safety net: stuck DS18B20 -> really power it off ----------
+# Switching off VDD alone is not enough: with VDD low a DS18B20 keeps running on parasite power
+# from the data line, which ESPHome actively drives high between transactions.
+# So: pause polling, pull VDD and the data line low for 2 s, then release everything.
+script:
+  - id: ds_power_cycle
+    mode: single
+    then:
+      - lambda: |-
+          id(ds_resets) += 1;
+          ESP_LOGW("ds18b20", "no reading for > 60 s: power-cycling the sensors (#%d)", id(ds_resets));
+          id(temp_supply).stop_poller();
+          id(temp_return).stop_poller();
+      - output.turn_off: ds_power
+      - lambda: |-
+          gpio_set_direction((gpio_num_t) ${pin_onewire}, GPIO_MODE_OUTPUT);
+          gpio_set_level((gpio_num_t) ${pin_onewire}, 0);
+      - delay: 2s
+      - output.turn_on: ds_power
+      - delay: 50ms
+      - lambda: |-
+          gpio_set_level((gpio_num_t) ${pin_onewire}, 1);   // one_wire restores the pin mode itself
+      - delay: 500ms
+      - lambda: |-
+          id(temp_supply).start_poller();
+          id(temp_return).start_poller();
+          ESP_LOGI("ds18b20", "sensors powered again, polling resumed");
+
+button:
+  - platform: restart
+    name: "Restart"
